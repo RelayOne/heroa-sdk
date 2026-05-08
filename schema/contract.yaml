@@ -1,0 +1,260 @@
+# Heroa SDK contract — single source of truth for SDK shapes.
+#
+# Per /home/eric/repos/heroa/CLAUDE.md, "SDK contract shapes (inputs,
+# outputs, error codes) live in sdk/schema/contract.yaml as the source
+# of truth. TS / Go / Python SDKs are generated-or-handwritten against
+# it. Any SDK shape change requires updating the contract + regenerating
+# / editing all three SDKs in the same commit."
+#
+# This file documents what each SDK currently emits on the wire so
+# changes that touch any SDK can be reviewed against a single canonical
+# definition. SDK code is hand-written today (not codegen); the contract
+# is the audit reference.
+#
+# Shapes are listed by SDK type name with the wire JSON keys. When
+# Go/TS/Python disagree on a shape, the discrepancy is listed under the
+# `Discrepancies` section at the bottom so the next refactor can converge.
+#
+# Ground truth references:
+#   Go    : sdk/go/client.go (DeployRequest, IngressPort, Instance, etc.)
+#   TS    : sdk/typescript/src/types.ts
+#   Python: sdk/python/src/heroa_sdk/types.py
+#
+# Schema version follows semver. Bump on any breaking shape change.
+
+version: "1.0.0"
+last_updated: "2026-05-05"
+
+# ─────────────────────────────────────────────────────────────────────
+# Top-level types
+# ─────────────────────────────────────────────────────────────────────
+
+types:
+
+  DeployRequest:
+    description: Tenant-facing deploy request. Translates into createMachineRequestWire on the wire.
+    fields:
+      template:
+        type: string
+        description: First-party template slug (e.g., "next-ssr"). Mutually exclusive with image.
+        required_one_of: [template, image]
+      image:
+        type: string
+        description: OCI reference (e.g., "oci://docker.io/library/alpine:3.19" or "oci://...@sha256:..."). Mutually exclusive with template.
+        required_one_of: [template, image]
+      region:
+        type: string
+        description: Requested region. Validated against tenant + template + app pin allowlists.
+      app_name:
+        type: string
+      app_region_pin:
+        type: string
+        optional: true
+      size:
+        type: string
+        enum: ["", "small", "medium", "large", "xlarge"]
+      ttl:
+        type: string
+        description: Go-duration string (e.g., "1h"). Empty = use template default.
+      restart_policy:
+        type: string
+        enum: ["", "no", "on-failure", "always"]
+      isolation:
+        type: string
+        enum: ["firecracker", "docker"]
+        default: firecracker
+        description: Per-load isolation mode (D-003).
+      env:
+        type: map[string,string]
+      files:
+        type: array
+        item_type: FileOverlay
+      command:
+        type: array
+        item_type: string
+      resources:
+        type: ResourceShape
+        optional: true
+      custom_hostnames:
+        type: array
+        item_type: string
+      region_policy:
+        type: string
+      metadata:
+        type: map[string,string]
+      idempotency_key:
+        type: string
+        optional: true
+      lifecycle:
+        type: Hooks
+        optional: true
+      egress_policy:
+        type: string
+        enum: ["", "allow-all", "allowed-domains", "canadian-only"]
+        default: allow-all
+      allowed_domains:
+        type: array
+        item_type: string
+        description: A-records resolved at VM create time and stamped as iptables ACCEPT rules. Only meaningful when egress_policy=allowed-domains.
+      ingress:
+        type: array
+        item_type: IngressPort
+
+  IngressPort:
+    description: Single port exposure on a VM.
+    fields:
+      port:
+        type: int
+        required: true
+      public:
+        type: boolean
+        description: True = DNAT from the host's public interface; False = bridge subnet only.
+      expose_path:
+        type: string
+        optional: true
+
+  Instance:
+    description: Read-side machine view. Returned by deploy/list/get.
+    fields:
+      id:        { type: string }
+      url:       { type: string }
+      hostnames: { type: array, item_type: string }
+      region:    { type: string }
+      size:      { type: string }
+      expires_at: { type: string, format: rfc3339 }
+      created_at: { type: string, format: rfc3339 }
+      state:     { type: string, enum: [pending, starting, running, stopping, stopped, destroying, destroyed, failed] }
+      metadata:  { type: map[string,string] }
+
+  ResourceShape:
+    description: Per-machine resource ask.
+    fields:
+      cpus:       { type: int }
+      memory_mb:  { type: int }
+      gpu:        { type: string, enum: ["", "none", "t4", "a10", "a100", "h100"] }
+
+  FileOverlay:
+    description: Static file injected into the rootfs at boot.
+    fields:
+      path:    { type: string, required: true }
+      content: { type: string, format: utf8-or-base64 }
+      mode:    { type: int, optional: true, default: 0o644 }
+
+  Hooks:
+    description: Lifecycle callbacks the agent fires.
+    fields:
+      on_ready: { type: string, optional: true, description: shell command }
+      on_stop:  { type: string, optional: true }
+
+  InstanceGroupRequest:
+    description: Bulk-create N instances backed by a shared template/image.
+    fields:
+      base:        { type: DeployRequest, description: spec applied to every member }
+      replicas:    { type: int, description: N instances to create }
+      name_prefix: { type: string, optional: true }
+
+# ─────────────────────────────────────────────────────────────────────
+# Error codes
+# ─────────────────────────────────────────────────────────────────────
+
+error_codes:
+  validation:
+    description: Caller-side input failed validation. 400.
+  auth:
+    description: Bearer token missing/invalid. 401.
+  region_not_allowed:
+    description: Requested region not on the tenant/app/template allowlist. 403.
+  template_region_excluded:
+    description: Template's own allowlist excludes the region. 403.
+  region_capacity:
+    description: Region allowed but no host can satisfy the resource ask. 403.
+  internal:
+    description: Server-side failure. 500.
+  idempotency_conflict:
+    description: idempotency_key replay with mismatched body. 409.
+  job_in_progress:
+    description: A fleet/secret rotation/etc. job is already in flight for this resource. 409.
+  concurrent_rotation:
+    description: A second secret rotation requested while one is propagating. 409.
+  oci_pull_failed:
+    description: OCI registry pull failed (auth, network, manifest invalid). 502.
+  oci_scan_blocked:
+    description: Trivy detected CRITICAL/HIGH vulns and tenant did not opt in. 403.
+  oci_signature_invalid:
+    description: cosign signature verification failed for a signed image. 403.
+  role_insufficient:
+    description: Tenant member's role lacks permission for the action. 403.
+
+# ─────────────────────────────────────────────────────────────────────
+# Wire-format types (control-plane request/response shapes)
+# ─────────────────────────────────────────────────────────────────────
+
+wire_types:
+
+  CreateMachineRequestWire:
+    description: What the SDKs POST to /v1/apps/{app}/machines. Server type api.CreateMachineRequest decodes this verbatim.
+    fields:
+      name:                   { type: string }
+      region:                 { type: string }
+      ttl:                    { type: string }
+      idempotency_key:        { type: string, optional: true }
+      config:                 { type: object }   # nested: env, guest, image, isolation_mode, mounts, metadata
+      metadata:               { type: map[string,string] }
+      egress_policy:          { type: string, optional: true }
+      allowed_domains:        { type: array, item_type: string, optional: true }
+      ingress:                { type: array, item_type: IngressPort, optional: true }
+      image:                  { type: string, optional: true, description: OCI ref alternative to config.image }
+
+  CreateAppRequestWire:
+    description: POST /v1/apps body.
+    fields:
+      app_name:    { type: string }
+      org_slug:    { type: string }
+      region_pin:  { type: string, optional: true }
+
+  AppResponseWire:
+    description: Returned by POST/GET /v1/apps[/{id}].
+    fields:
+      id:         { type: string }
+      org_id:     { type: string }
+      tenant_id:  { type: string }
+      name:       { type: string }
+      status:     { type: string, enum: [active, deleting, deleted] }
+      region_pin: { type: string, optional: true }
+
+# ─────────────────────────────────────────────────────────────────────
+# Discrepancies (audit-only; not contract violations)
+# ─────────────────────────────────────────────────────────────────────
+
+discrepancies:
+  - shape: DeployRequest.allowed_domains
+    note: |
+      Spec 06 added an OCI image alternative; older Go fields exposed AllowedDomains
+      as a top-level slice while TS exposes egress.allowed_domains nested under egress.
+      Wire format is consistent (allowed_domains at top level); the nesting in TS
+      is a client convenience. No remediation needed.
+  - shape: IngressPort.expose_path
+    note: |
+      Field optional in all three SDKs but the placement daemon only honors it for
+      Public=true ports; for internal-only ports the field is silently ignored.
+      Documented under wire_types above; no SDK-side change.
+
+# ─────────────────────────────────────────────────────────────────────
+# Migration policy
+# ─────────────────────────────────────────────────────────────────────
+
+migration_policy: |
+  Per CLAUDE.md: "Any SDK shape change requires updating the contract +
+  regenerating / editing all three SDKs in the same commit."
+
+  Practical workflow when introducing a new field:
+    1. Add the field to types.<TypeName>.fields here.
+    2. Bump version (patch for additive, minor for renames, major for removals).
+    3. Edit Go (sdk/go/client.go) + TS (sdk/typescript/src/types.ts) +
+       Python (sdk/python/src/heroa_sdk/types.py) in the same PR.
+    4. Add a wire-decode test in cmd/control-plane/sdk_contract_test.go that
+       proves all three SDKs encode the new field identically.
+
+  When removing a field, follow the same ordering, plus the dual-accept
+  migration phase (server keeps decoding the old name silently for one
+  release before failing).
